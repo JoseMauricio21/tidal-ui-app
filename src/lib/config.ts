@@ -172,7 +172,7 @@ const ALL_API_TARGETS = [
 		weight: 15,
 		requiresProxy: false,
 		category: 'auto-only'
-	},
+	}
 ] satisfies ApiClusterTarget[];
 
 const US_API_TARGETS = [
@@ -572,7 +572,7 @@ export async function fetchWithCORS(url: string, options?: RequestInit): Promise
 		throw new Error('Invalid origin target configuration.');
 	}
 
-	const totalAttempts = Math.max(3, uniqueTargets.length);
+	const totalAttempts = 2;
 	let lastError: unknown = null;
 	let lastResponse: Response | null = null;
 	let lastUnexpectedResponse: Response | null = null;
@@ -603,6 +603,11 @@ export async function fetchWithCORS(url: string, options?: RequestInit): Promise
 				}
 				lastUnexpectedResponse = response;
 				continue;
+			}
+
+			// For 401 errors, return immediately without retrying
+			if (response.status === 401) {
+				return response;
 			}
 
 			lastResponse = response;

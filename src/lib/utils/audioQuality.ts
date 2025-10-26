@@ -2,6 +2,8 @@ import type { AudioQuality, Track } from '$lib/types';
 
 const QUALITY_PRIORITY: readonly AudioQuality[] = [
 	'HI_RES_LOSSLESS',
+	'DOLBY_ATMOS',
+	'SONY_360RA',
 	'LOSSLESS',
 	'HIGH',
 	'LOW'
@@ -19,6 +21,17 @@ const QUALITY_TOKENS: Record<AudioQuality, readonly string[]> = {
 		'MASTER',
 		'MASTER_QUALITY',
 		'MQA'
+	],
+	DOLBY_ATMOS: [
+		'DOLBY_ATMOS',
+		'DOLBYATMOS',
+		'ATMOS'
+	],
+	SONY_360RA: [
+		'SONY_360RA',
+		'SONY360RA',
+		'360RA',
+		'360_RA'
 	],
 	LOSSLESS: ['LOSSLESS', 'HIFI'],
 	HIGH: ['HIGH', 'HIGH_QUALITY'],

@@ -3,6 +3,8 @@ import { writable, derived, get } from 'svelte/store';
 import type { Track, AudioQuality } from '$lib/types';
 import { deriveTrackQuality } from '$lib/utils/audioQuality';
 import { userPreferencesStore } from '$lib/stores/userPreferences';
+import { albumHistoryStore } from '$lib/stores/albumHistory';
+import { saveToListeningHistory } from '$lib/utils/clientHistory';
 
 interface PlayerState {
 	currentTrack: Track | null;
@@ -26,7 +28,7 @@ const initialState: PlayerState = {
 	currentTime: 0,
 	duration: 0,
 	volume: 0.8,
-	quality: initialPreferences.playbackQuality,
+	quality: 'LOSSLESS', // Force CD quality by default for immediate playback
 	qualitySource: 'manual',
 	isLoading: false,
 	queue: [],
@@ -60,6 +62,20 @@ function createPlayerStore() {
 		subscribe,
 		setTrack: (track: Track) =>
 			update((state) => {
+				// Track album in history with artist info
+				if (track.album) {
+					// Ensure album has artist info from track if not already present
+					const albumWithArtist = {
+						...track.album,
+						artist: track.album.artist || track.artist,
+						artists: track.album.artists || (track.artist ? [track.artist] : [])
+					};
+					albumHistoryStore.addAlbum(albumWithArtist);
+				}
+				
+				// Save to listening history
+				saveToListeningHistory(track);
+				
 				const next: PlayerState = {
 					...state,
 					currentTrack: track,
@@ -89,6 +105,22 @@ function createPlayerStore() {
 					? Math.min(Math.max(startIndex, 0), queue.length - 1)
 					: -1;
 				const nextTrack = hasTracks ? queue[clampedIndex]! : null;
+				// Track album in history with artist info
+				if (nextTrack?.album) {
+					// Ensure album has artist info from track if not already present
+					const albumWithArtist = {
+						...nextTrack.album,
+						artist: nextTrack.album.artist || nextTrack.artist,
+						artists: nextTrack.album.artists || (nextTrack.artist ? [nextTrack.artist] : [])
+					};
+					albumHistoryStore.addAlbum(albumWithArtist);
+				}
+				
+				// Save first track to listening history
+				if (nextTrack) {
+					saveToListeningHistory(nextTrack);
+				}
+				
 				let next: PlayerState = {
 					...state,
 					queue,

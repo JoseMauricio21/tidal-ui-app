@@ -1,34 +1,74 @@
-<!-- Literally unused because it doesn't work -->
-
 <script lang="ts">
 	import type { AudioQuality } from '$lib/types';
 	import { playerStore } from '$lib/stores/player';
 	import { Settings, Check } from 'lucide-svelte';
+	import { deriveTrackQuality, normalizeQualityToken } from '$lib/utils/audioQuality';
 
 	let isOpen = $state(false);
-	const disabledQualities = new Set<AudioQuality>();
 
 	const qualities: { value: AudioQuality; label: string; description: string }[] = [
+		{ value: 'LOSSLESS', label: 'CD Lossless', description: '16-bit/44.1 kHz FLAC (Recomendado)' },
+		{ value: 'HIGH', label: 'High', description: '320k AAC' },
+		{ value: 'LOW', label: 'Low', description: '96k AAC' },
 		{
 			value: 'HI_RES_LOSSLESS',
 			label: 'Hi-Res',
-			description: '24-bit FLAC up to 192 kHz'
+			description: '24-bit FLAC up to 192 kHz (Experimental)'
 		},
-		{ value: 'LOSSLESS', label: 'Lossless', description: '16-bit/44.1 kHz FLAC' },
-		{ value: 'HIGH', label: 'High', description: '320k AAC' },
-		{ value: 'LOW', label: 'Low', description: '96k AAC' }
+		{
+			value: 'DOLBY_ATMOS',
+			label: 'Dolby Atmos',
+			description: 'Immersive spatial audio (Experimental)'
+		},
+		{
+			value: 'SONY_360RA',
+			label: 'Sony 360 Reality Audio',
+			description: '360-degree spatial sound (Experimental)'
+		}
 	];
 
 	function isQualityDisabled(quality: AudioQuality): boolean {
-		return disabledQualities.has(quality);
+		const currentTrack = $playerStore.currentTrack;
+		if (!currentTrack) return false;
+
+		// Check if track has audioModes array (for Dolby Atmos and Sony 360RA)
+		const audioModes = currentTrack.audioModes || [];
+		
+		if (quality === 'DOLBY_ATMOS') {
+			return !audioModes.some(mode => 
+				mode.toUpperCase().includes('ATMOS') || mode.toUpperCase().includes('DOLBY')
+			);
+		}
+
+		if (quality === 'SONY_360RA') {
+			return !audioModes.some(mode => 
+				mode.toUpperCase().includes('360') || mode.toUpperCase().includes('SONY')
+			);
+		}
+
+		// For Hi-Res, use the utility function
+		if (quality === 'HI_RES_LOSSLESS') {
+			const derivedQuality = deriveTrackQuality(currentTrack);
+			return derivedQuality !== 'HI_RES_LOSSLESS';
+		}
+
+		// Other qualities are always available
+		return false;
 	}
 
 	function selectQuality(quality: AudioQuality) {
 		if (isQualityDisabled(quality)) {
+			console.warn(`Quality ${quality} is not available for the current track`);
 			return;
 		}
-		playerStore.setQuality(quality);
-		isOpen = false;
+		
+		try {
+			playerStore.setQuality(quality);
+			isOpen = false;
+			console.log(`Audio quality changed to: ${quality}`);
+		} catch (error) {
+			console.error('Failed to set audio quality:', error);
+		}
 	}
 
 	function toggleDropdown() {
@@ -54,14 +94,28 @@
 		<span class="text-sm">
 			{qualities.find((q) => q.value === $playerStore.quality)?.label || 'Quality'}
 		</span>
+		{#if $playerStore.quality === 'HI_RES_LOSSLESS'}
+			<span class="text-xs bg-blue-600 text-white px-1.5 py-0.5 rounded-full font-medium">
+				Hi-Res
+			</span>
+		{:else if $playerStore.quality === 'DOLBY_ATMOS'}
+			<span class="text-xs bg-purple-600 text-white px-1.5 py-0.5 rounded-full font-medium">
+				Atmos
+			</span>
+		{:else if $playerStore.quality === 'SONY_360RA'}
+			<span class="text-xs bg-orange-600 text-white px-1.5 py-0.5 rounded-full font-medium">
+				360RA
+			</span>
+		{/if}
 	</button>
 
 	{#if isOpen}
 		<div
-			class="absolute right-0 z-50 mt-2 w-64 overflow-hidden rounded-lg border border-gray-700 bg-gray-800 shadow-lg"
+			class="absolute right-0 z-50 bottom-full mb-2 w-64 overflow-hidden rounded-lg border border-gray-700 bg-gray-800 shadow-lg"
 		>
 			<div class="border-b border-gray-700 p-2">
 				<h3 class="text-sm font-semibold text-white">Audio Quality</h3>
+				<p class="text-xs text-yellow-400 mt-1">⚡ CD Lossless recommended for best performance</p>
 			</div>
 			<div class="py-1">
 				{#each qualities as quality}
@@ -84,9 +138,19 @@
 							>
 								{quality.description}
 								{#if isQualityDisabled(quality.value)}
-									<span class="ml-1 text-[10px] tracking-wide text-gray-500 uppercase"
-										>Unavailable</span
-									>
+									{#if quality.value === 'HI_RES_LOSSLESS'}
+										<span class="ml-1 text-[10px] tracking-wide text-gray-500 uppercase"
+											>Not available for this track</span
+										>
+									{:else if quality.value === 'DOLBY_ATMOS' || quality.value === 'SONY_360RA'}
+										<span class="ml-1 text-[10px] tracking-wide text-gray-500 uppercase"
+											>Not available for this track</span
+										>
+									{:else}
+										<span class="ml-1 text-[10px] tracking-wide text-gray-500 uppercase"
+											>Unavailable</span
+										>
+									{/if}
 								{/if}
 							</div>
 						</div>

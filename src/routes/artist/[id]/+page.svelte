@@ -5,10 +5,13 @@
 	import type { Album, ArtistDetails, AudioQuality } from '$lib/types';
 	import TopTracksGrid from '$lib/components/TopTracksGrid.svelte';
 	import { onMount } from 'svelte';
-	import { ArrowLeft, User, Download, LoaderCircle } from 'lucide-svelte';
+	import { ArrowLeft, User, Download } from 'lucide-svelte';
+	import Loader from '$lib/components/Loader.svelte';
 	import { playerStore } from '$lib/stores/player';
 	import { downloadPreferencesStore } from '$lib/stores/downloadPreferences';
 	import { userPreferencesStore } from '$lib/stores/userPreferences';
+
+	const spotifyFont = "font-family: 'Circular Std', 'Circular Pro', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; letter-spacing: -0.02em;";
 
 	let artist = $state<ArtistDetails | null>(null);
 	let artistImage = $state<string | null>(null);
@@ -37,6 +40,13 @@
 	onMount(async () => {
 		if (artistId) {
 			await loadArtist(parseInt(artistId));
+		}
+	});
+
+	// Watch for URL changes and reload artist
+	$effect(() => {
+		if (artistId) {
+			loadArtist(parseInt(artistId));
 		}
 	});
 
@@ -205,12 +215,12 @@
 </script>
 
 <svelte:head>
-	<title>{artist?.name || 'Artist'} - TIDAL UI</title>
+	<title>{artist?.name || 'Artist'} </title>
 </svelte:head>
 
 {#if isLoading}
 	<div class="flex items-center justify-center py-24">
-		<LoaderCircle size={16} class="h-16 w-16 animate-spin text-blue-500" />
+		<Loader size={64} />
 	</div>
 {:else if error}
 	<div class="mx-auto max-w-2xl py-12">
@@ -226,14 +236,14 @@
 		</div>
 	</div>
 {:else if artist}
-	<div class="space-y-6 pb-32 lg:pb-40">
+	<div class="space-y-10 pb-60 lg:pb-40">
 		<!-- Back Button -->
 		<button
 			onclick={() => window.history.back()}
-			class="flex items-center gap-2 text-gray-400 transition-colors hover:text-white"
+			class="mt-4 flex items-center gap-2 text-gray-400 transition-colors hover:text-white"
 		>
 			<ArrowLeft size={20} />
-			Back
+			Volver
 		</button>
 
 		<!-- Artist Header -->
@@ -253,37 +263,42 @@
 
 			<!-- Artist Info -->
 			<div class="flex-1">
-				<p class="mb-2 text-sm text-gray-400">ARTIST</p>
+				<p class="mb-2 text-sm text-gray-400">ARTISTA</p>
 				<h1 class="mb-4 text-4xl font-bold md:text-6xl">{artist.name}</h1>
 
-				<div class="mb-6 flex flex-wrap items-center gap-4">
-					{#if artist.popularity}
-						<div class="text-sm text-gray-400">
-							Popularity: <span class="font-semibold text-white">{artist.popularity}</span>
-						</div>
+				<div class="mb-6 flex flex-wrap items-center gap-4 text-sm text-gray-400">
+					{#if discography.length > 0}
+						<div>{discography.length} álbumes</div>
 					{/if}
-					{#if artist.artistTypes && artist.artistTypes.length > 0}
-						{#each artist.artistTypes as type}
-							<div
-								class="rounded-full bg-blue-900/30 px-3 py-1 text-xs font-semibold text-blue-400"
-							>
-								{type}
-							</div>
-						{/each}
+					{#if topTracks.length > 0}
+						<div>{topTracks.length} canciones populares</div>
+					{/if}
+					{#if artist.popularity}
+						<div class="rounded bg-blue-900/30 px-2 py-1 text-xs font-semibold text-blue-400">
+							Popularidad: {artist.popularity}
+						</div>
 					{/if}
 				</div>
 
-				{#if artist.artistRoles && artist.artistRoles.length > 0}
-					<div class="mb-4">
-						<h3 class="mb-2 text-sm font-semibold text-gray-400">Roles</h3>
-						<div class="flex flex-wrap gap-2">
-							{#each artist.artistRoles as role}
-								<div class="rounded-full bg-gray-800 px-3 py-1 text-xs text-gray-300">
-									{role.category}
-								</div>
-							{/each}
-						</div>
-					</div>
+				{#if discography.length > 0}
+					<button
+						onclick={handleDownloadDiscography}
+						type="button"
+						class="flex items-center gap-2 rounded-full border border-blue-400/40 px-6 py-3 text-sm font-semibold text-blue-300 transition-colors hover:border-blue-400 hover:text-blue-200 disabled:cursor-not-allowed disabled:opacity-60"
+						disabled={isDownloadingDiscography}
+						aria-live="polite"
+					>
+						{#if isDownloadingDiscography}
+							<Loader size={18} />
+							Descargando {discographyProgress.completed}/{displayTrackTotal(discographyProgress.total)}
+						{:else}
+							<Download size={18} />
+							Descargar Discografía
+						{/if}
+					</button>
+				{/if}
+				{#if discographyError}
+					<p class="mt-2 text-sm text-red-400" role="alert">{discographyError}</p>
 				{/if}
 			</div>
 		</div>
@@ -291,62 +306,32 @@
 		<!-- Music Overview -->
 		<div class="space-y-12">
 			<section>
-				<div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-					<div>
-						<h2 class="text-2xl font-semibold text-white">Top Tracks</h2>
-						<p class="text-sm text-gray-400">Best songs from {artist.name}.</p>
-					</div>
+				<div class="mb-6">
+					<h2 class="text-2xl font-bold text-white" style={spotifyFont}>
+						🎵 Canciones Populares
+					</h2>
+					<p class="text-sm text-gray-400 mt-1">Las mejores canciones de {artist.name}</p>
 				</div>
 				{#if topTracks.length > 0}
-					<div class="mt-6 overflow-hidden rounded-2xl border border-gray-800 bg-gray-900/40 p-4">
+					<div class="overflow-hidden rounded-2xl border border-gray-800 bg-gray-900/40 p-4">
 						<TopTracksGrid tracks={topTracks} />
 					</div>
 				{:else}
-					<div
-						class="mt-6 rounded-lg border border-gray-800 bg-gray-900/40 p-6 text-sm text-gray-400"
-					>
-						<p>No top tracks available for this artist yet.</p>
+					<div class="rounded-lg border border-gray-800 bg-gray-900/40 p-6 text-sm text-gray-400">
+						<p>No hay canciones populares disponibles para este artista.</p>
 					</div>
 				{/if}
 			</section>
 
 			<section>
-				<div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-					<div>
-						<h2 class="text-2xl font-semibold text-white">Discography</h2>
-						<p class="text-sm text-gray-400">Albums, EPs, and more from {artist.name}.</p>
-					</div>
-					<div class="flex items-center gap-2">
-						<button
-							onclick={handleDownloadDiscography}
-							type="button"
-							class="inline-flex items-center gap-2 rounded-full border border-blue-600 bg-blue-600/10 px-4 py-2 text-sm font-semibold text-blue-100 transition-colors hover:bg-blue-600/20 disabled:cursor-not-allowed disabled:opacity-60"
-							disabled={isDownloadingDiscography || discography.length === 0}
-							aria-live="polite"
-						>
-							{#if isDownloadingDiscography}
-								<LoaderCircle size={16} class="animate-spin" />
-								<span class="whitespace-nowrap">
-									Downloading
-									{#if discographyProgress.total > 0}
-										{discographyProgress.completed}/{displayTrackTotal(discographyProgress.total)}
-									{:else}
-										{discographyProgress.completed}
-									{/if}
-									tracks
-								</span>
-							{:else}
-								<Download size={16} />
-								<span class="whitespace-nowrap">Download Discography</span>
-							{/if}
-						</button>
-					</div>
+				<div class="mb-6">
+					<h2 class="text-2xl font-bold text-white" style={spotifyFont}>
+						💿 Discografía
+					</h2>
+					<p class="text-sm text-gray-400 mt-1">Álbumes, EPs y más de {artist.name}</p>
 				</div>
-				{#if discographyError}
-					<p class="mt-2 text-sm text-red-400" role="alert">{discographyError}</p>
-				{/if}
 				{#if discography.length > 0}
-					<div class="mt-6 grid gap-4 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5">
+					<div class="grid gap-4 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5">
 						{#each discography as album (album.id)}
 							<div
 								class="group relative flex h-full flex-col rounded-xl border border-gray-800 bg-gray-900/40 p-4 text-center transition-colors hover:border-blue-700 hover:bg-gray-900"
@@ -359,7 +344,7 @@
 									aria-label={`Download ${album.title}`}
 								>
 									{#if albumDownloadStates[album.id]?.downloading}
-										<LoaderCircle size={16} class="animate-spin" />
+										<Loader size={16} />
 									{:else}
 										<Download size={16} />
 									{/if}
@@ -371,7 +356,19 @@
 									<div
 										class="mx-auto aspect-square w-full max-w-[220px] overflow-hidden rounded-lg bg-gray-800"
 									>
-										{#if album.cover}
+										{#if album.videoCover}
+											<video
+												src={losslessAPI.getVideoCoverUrl(album.videoCover, '640')}
+												poster={album.cover ? losslessAPI.getCoverUrl(album.cover, '640') : undefined}
+												aria-label={album.title}
+												class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+												autoplay
+												loop
+												muted
+												playsinline
+												preload="metadata"
+											></video>
+										{:else if album.cover}
 											<img
 												src={losslessAPI.getCoverUrl(album.cover, '640')}
 												alt={album.title}
@@ -396,15 +393,9 @@
 								</a>
 								{#if albumDownloadStates[album.id]?.downloading}
 									<p class="mt-3 text-xs text-blue-300">
-										Downloading
-										{#if albumDownloadStates[album.id]?.total}
-											{albumDownloadStates[album.id]?.completed ?? 0}/{displayTrackTotal(
-												albumDownloadStates[album.id]?.total ?? 0
-											)}
-										{:else}
-											{albumDownloadStates[album.id]?.completed ?? 0}
-										{/if}
-										tracks…
+										Descargando {albumDownloadStates[album.id]?.completed ?? 0}/{displayTrackTotal(
+											albumDownloadStates[album.id]?.total ?? 0
+										)} canciones…
 									</p>
 								{:else if albumDownloadStates[album.id]?.error}
 									<p class="mt-3 text-xs text-red-400" role="alert">
@@ -415,24 +406,11 @@
 						{/each}
 					</div>
 				{:else}
-					<div
-						class="mt-6 rounded-lg border border-gray-800 bg-gray-900/40 p-6 text-sm text-gray-400"
-					>
-						<p>Discography information isn&apos;t available right now.</p>
+					<div class="rounded-lg border border-gray-800 bg-gray-900/40 p-6 text-sm text-gray-400">
+						<p>No hay información de discografía disponible en este momento.</p>
 					</div>
 				{/if}
 			</section>
 		</div>
-
-		{#if artist.url}
-			<a
-				href={artist.url}
-				target="_blank"
-				rel="noopener noreferrer"
-				class="inline-block text-sm text-blue-400 transition-colors hover:text-blue-300"
-			>
-				View profile →
-			</a>
-		{/if}
 	</div>
 {/if}

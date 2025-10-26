@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
+	import { goto } from '$app/navigation';
 	import { playerStore } from '$lib/stores/player';
 	import { lyricsStore } from '$lib/stores/lyrics';
 	import { losslessAPI, DASH_MANIFEST_UNAVAILABLE_CODE } from '$lib/api';
@@ -22,9 +23,9 @@
 		X,
 		Shuffle,
 		ScrollText,
-		Download,
-		LoaderCircle
+		Download
 	} from 'lucide-svelte';
+	import Loader from './Loader.svelte';
 
 	type ShakaPlayerInstance = {
 		load: (uri: string) => Promise<void>;
@@ -61,9 +62,20 @@
 	let containerElement: HTMLDivElement | null = null;
 	let resizeObserver: ResizeObserver | null = null;
 	let showQueuePanel = $state(false);
-	const streamCache = new Map<string, string>();
+	// estado para expansión de la carátula (fix: evitar error en plantilla)
+	let expandedCover = $state(false);
+	let isCompact = $state(false);
+	let compactTimer: ReturnType<typeof setTimeout> | null = null;
+	let isHovering = $state(false);
+
+	function toggleCoverExpand() {
+		expandedCover = !expandedCover;
+		// notificar cambio de altura cuando la carátula cambia de tamaño
+		notifyContainerHeight();
+	}
+    const streamCache = new Map<string, string>();
 	let preloadingCacheKey: string | null = null;
-	const PRELOAD_THRESHOLD_SECONDS = 12;
+	const PRELOAD_THRESHOLD_SECONDS = 45;
 	const hiResQualities = new Set<AudioQuality>(['HI_RES_LOSSLESS']);
 	const dashManifestCache = new Map<string, DashManifestResult>();
 	let shakaNamespace: ShakaNamespace | null = null;
@@ -249,11 +261,36 @@
 	}
 
 	async function preloadNextTrack(track: Track) {
-		const cacheKey = getCacheKey(track.id, 'HI_RES_LOSSLESS');
-		if (dashManifestCache.has(cacheKey) || preloadingCacheKey === cacheKey) {
-			return;
+		const quality = $playerStore.quality;
+		// Precargar tanto DASH como stream estándar en paralelo de manera agresiva
+		const dashKey = getCacheKey(track.id, 'HI_RES_LOSSLESS');
+		const standardKey = getCacheKey(track.id, quality);
+		
+		// Precarga en paralelo sin esperar
+		const promises: Promise<unknown>[] = [];
+		
+		// Precarga DASH si es necesario
+		if (isHiResQuality(quality) && !dashManifestCache.has(dashKey) && preloadingCacheKey !== dashKey) {
+			promises.push(preloadDashManifest(track).catch(() => {}));
 		}
-		await preloadDashManifest(track);
+		
+		// Precarga stream estándar en paralelo
+		if (!streamCache.has(standardKey)) {
+			promises.push(resolveStream(track, quality).catch(() => {}));
+		}
+		
+		// También precargar LOSSLESS como fallback si estamos en Hi-Res
+		if (isHiResQuality(quality)) {
+			const losslessKey = getCacheKey(track.id, 'LOSSLESS');
+			if (!streamCache.has(losslessKey)) {
+				promises.push(resolveStream(track, 'LOSSLESS').catch(() => {}));
+			}
+		}
+		
+		// No esperamos, solo disparamos las precargas
+		if (promises.length > 0) {
+			Promise.all(promises).catch(() => {});
+		}
 	}
 
 	function maybePreloadNextTrack(remainingSeconds: number) {
@@ -297,6 +334,16 @@
 			lastQualityForTrack = $playerStore.quality;
 			currentPlaybackQuality = null;
 			loadTrack(current);
+			
+			// Mostrar versión expandida por 5 segundos al cambiar canción
+			showExpandedThenCompact();
+			
+			// Precargar inmediatamente la siguiente canción cuando se carga una nueva
+			const { queue, queueIndex } = $playerStore;
+			const nextTrack = queue[queueIndex + 1];
+			if (nextTrack) {
+				setTimeout(() => preloadNextTrack(nextTrack), 100);
+			}
 		}
 	});
 
@@ -388,7 +435,17 @@
 		pruneStreamCache();
 		if (audioElement) {
 			audioElement.crossOrigin = 'anonymous';
+			// Set playback to start immediately when enough data is available
+			audioElement.preload = 'auto';
 			audioElement.load();
+			// Intentar reproducir inmediatamente para reducir latencia
+			if ($playerStore.isPlaying) {
+				// Use promise to start playback as soon as possible
+				const playPromise = audioElement.play();
+				if (playPromise !== undefined) {
+					playPromise.catch(() => {});
+				}
+			}
 		}
 	}
 
@@ -413,22 +470,68 @@
 			type: manifestResult.contentType ?? 'application/dash+xml'
 		});
 		hiResObjectUrl = URL.createObjectURL(blob);
+
+		// ensure Shaka player instance attached to audioElement
 		const player = await ensureShakaPlayer();
 		if (sequence !== loadSequence) {
 			return manifestResult;
 		}
-		if (audioElement) {
-			audioElement.pause();
-			audioElement.removeAttribute('src');
-			audioElement.load();
+
+		try {
+			// pause native element and clear src to allow Shaka to take control
+			if (audioElement) {
+				try {
+					audioElement.pause();
+				} catch (err) {
+					/* ignore */
+				}
+				audioElement.removeAttribute('src');
+				audioElement.load();
+				audioElement.crossOrigin = 'anonymous';
+			}
+
+			// unload any previous content then load the MPD (object URL)
+			try {
+				await player.unload();
+			} catch (e) {
+				// non-fatal, continue to load
+				console.debug('Shaka unload failed (continuing):', e);
+			}
+
+			await player.load(hiResObjectUrl);
+
+			// confirm still the intended load sequence
+			if (sequence !== loadSequence) {
+				return manifestResult;
+			}
+
+			// mark DASH active and clear streamUrl (we use Shaka)
+			dashPlaybackActive = true;
+			streamUrl = '';
+			currentPlaybackQuality = 'HI_RES_LOSSLESS';
+			pruneDashManifestCache();
+
+			// If UI/state indicates playback, start playing (attempt)
+			if ($playerStore.isPlaying && audioElement) {
+				// intentar reproducir inmediatamente; si falla, dejar que el efecto global lo maneje
+				audioElement.play().catch((err) => {
+					console.debug('Shaka-driven audioElement.play() failed:', err);
+				});
+			}
+
+			return manifestResult;
+		} catch (error) {
+			// si falla la carga DASH, asegurarse de limpiar estado para fallback
+			try {
+				await player.unload();
+			} catch (_) {
+				// ignore
+			}
+			dashPlaybackActive = false;
+			hiResObjectUrl && URL.revokeObjectURL(hiResObjectUrl);
+			hiResObjectUrl = null;
+			throw error;
 		}
-		await player.unload();
-		await player.load(hiResObjectUrl);
-		dashPlaybackActive = true;
-		streamUrl = '';
-		currentPlaybackQuality = 'HI_RES_LOSSLESS';
-		pruneDashManifestCache();
-		return manifestResult;
 	}
 
 	async function updateSampleRateForTrack(
@@ -470,37 +573,42 @@
 		}
 
 		try {
+			// Force LOSSLESS for immediate playback, skip Hi-Res attempts to avoid delays
 			if (isHiResQuality(requestedQuality)) {
-				try {
-					const hiResQuality: AudioQuality = 'HI_RES_LOSSLESS';
-					const result = await loadDashTrack(track, hiResQuality, sequence);
-					if (result.kind === 'dash') {
-						scheduleSampleRateUpdate(hiResQuality);
-						return;
-					}
-					console.info('Dash endpoint returned FLAC fallback. Using lossless stream.');
-				} catch (dashError) {
-					const coded = dashError as { code?: string };
-					if (coded?.code === DASH_MANIFEST_UNAVAILABLE_CODE) {
-						dashManifestCache.delete(getCacheKey(track.id, 'HI_RES_LOSSLESS'));
-					}
-					console.warn('DASH playback failed, falling back to lossless stream.', dashError);
-				}
+				console.info('[AudioPlayer] Hi-Res quality requested, starting with LOSSLESS for immediate playback.');
 				scheduleSampleRateUpdate('LOSSLESS');
 				await loadStandardTrack(track, 'LOSSLESS', sequence);
+				
+				// Try to upgrade to Hi-Res in background after playback starts
+				setTimeout(async () => {
+					if (sequence !== loadSequence || currentTrackId !== track.id) return;
+					try {
+						const hiResQuality: AudioQuality = 'HI_RES_LOSSLESS';
+						const result = await loadDashTrack(track, hiResQuality, sequence);
+						if (result.kind === 'dash' && sequence === loadSequence) {
+							scheduleSampleRateUpdate(hiResQuality);
+						}
+					} catch (error) {
+						// Silently stay on LOSSLESS if Hi-Res fails
+						console.debug('[AudioPlayer] Background Hi-Res upgrade failed, staying on LOSSLESS');
+					}
+				}, 2000); // Wait 2 seconds before attempting upgrade
 				return;
 			}
 
+			// For non-Hi-Res qualities, load normally
 			await loadStandardTrack(track, requestedQuality, sequence);
 			scheduleSampleRateUpdate(requestedQuality);
 		} catch (error) {
 			console.error('Failed to load track:', error);
-			if (sequence === loadSequence && requestedQuality !== 'LOSSLESS' && !isHiResQuality(requestedQuality)) {
+			// Fallback to LOSSLESS if initial load fails
+			if (sequence === loadSequence && requestedQuality !== 'LOSSLESS') {
 				try {
+					console.info('[AudioPlayer] Falling back to LOSSLESS quality.');
 					await loadStandardTrack(track, 'LOSSLESS', sequence);
 					scheduleSampleRateUpdate('LOSSLESS');
 				} catch (fallbackError) {
-					console.error('Secondary lossless fallback failed:', fallbackError);
+					console.error('LOSSLESS fallback also failed:', fallbackError);
 				}
 			}
 		} finally {
@@ -667,7 +775,7 @@
 	function toggleMute() {
 		if (isMuted) {
 			playerStore.setVolume(previousVolume);
-			isMuted = false;
+		 isMuted = false;
 		} else {
 			previousVolume = $playerStore.volume;
 			playerStore.setVolume(0);
@@ -692,6 +800,35 @@
 			return 'Hi-Res';
 		}
 		return quality;
+	}
+
+	// Devuelve el título del álbum truncado a `max` caracteres visibles.
+	// Si el título es más largo, añade una elipsis unicode (…).
+	// Valor por defecto aumentado a 30 según solicitud del usuario.
+	function formatAlbumTitle(title?: string | null, max = 30): string {
+		if (!title) return '';
+		// Normalizar espacios consecutivos a uno solo para evitar contar múltiples espacios
+		const cleaned = title.replace(/\s+/g, ' ').trim();
+		return cleaned.length > max ? cleaned.slice(0, max) + '…' : cleaned;
+	}
+
+	// descripción legible para cada calidad (mostrar en UI)
+	function getQualityDetail(quality?: AudioQuality | string | null): string {
+		const q = (quality ?? $playerStore.quality) as string;
+		switch (q) {
+			case 'HI_RES_LOSSLESS':
+				// Mostrar solo el detalle técnico, sin repetir la etiqueta "Hi-Res" en la segunda columna
+				return 'FLAC 24-bit (DASH) hasta 192 kHz';
+			case 'LOSSLESS':
+				// Evitar repetir "CD" en el detalle (se muestra con formatQualityLabel)
+				return 'FLAC 16-bit / 44.1 kHz';
+			case 'AAC320':
+				return 'AAC 320kbps — Streaming de alta calidad AAC';
+			case 'AAC96':
+				return 'AAC 96kbps — Ahorro de datos AAC';
+			default:
+				return '';
+		}
 	}
 
 	function formatSampleRate(value?: number | null): string | null {
@@ -969,6 +1106,10 @@
 		}
 
 		return () => {
+			if (compactTimer) {
+				clearTimeout(compactTimer);
+				compactTimer = null;
+			}
 			resizeObserver?.disconnect();
 			cleanupMediaSessionHandlers?.();
 			cleanupMediaSessionHandlers = null;
@@ -992,6 +1133,59 @@
 			onHeightChange(containerElement.offsetHeight ?? 0);
 		}
 	}
+
+	function showExpandedThenCompact() {
+		// Limpiar timer anterior si existe
+		if (compactTimer) {
+			clearTimeout(compactTimer);
+			compactTimer = null;
+		}
+		
+		// Mostrar versión expandida
+		isCompact = false;
+		
+		// Después de 5 segundos, cambiar a versión compacta
+		compactTimer = setTimeout(() => {
+			isCompact = true;
+			compactTimer = null;
+		}, 5000);
+	}
+
+	function toggleCompactMode() {
+		if (compactTimer) {
+			clearTimeout(compactTimer);
+			compactTimer = null;
+		}
+		isCompact = !isCompact;
+	}
+
+	function handleMouseEnter() {
+		isHovering = true;
+	}
+
+	function handleMouseLeave() {
+		isHovering = false;
+	}
+
+	function handleDoubleClick() {
+		lyricsStore.toggle();
+	}
+
+	function navigateToAlbum(event: MouseEvent) {
+		event.stopPropagation();
+		const albumId = $playerStore.currentTrack?.album?.id;
+		if (albumId) {
+			goto(`/album/${albumId}`);
+		}
+	}
+
+	function navigateToArtist(event: MouseEvent) {
+		event.stopPropagation();
+		const artistId = $playerStore.currentTrack?.artist?.id;
+		if (artistId) {
+			goto(`/artist/${artistId}`);
+		}
+	}
 </script>
 
 <audio
@@ -1004,589 +1198,754 @@
 	onloadedmetadata={updateBufferedPercent}
 	onprogress={handleProgress}
 	onerror={handleAudioError}
+	preload="auto"
 	class="hidden"
 ></audio>
 
+{#if $playerStore.currentTrack}
 <div
-	class="audio-player-backdrop fixed inset-x-0 bottom-0 z-50 px-4 pt-16 pb-5 sm:px-6 sm:pt-16 sm:pb-6"
+	class="audio-player-backdrop fixed bottom-4 left-1/2 transform -translate-x-1/2 z-50 w-[95%] max-w-2xl s-7jTt0_FmVq-J {isCompact && !isHovering ? 'compact' : ''}"
 	bind:this={containerElement}
+	ondblclick={handleDoubleClick}
+	onmouseenter={handleMouseEnter}
+	onmouseleave={handleMouseLeave}
+	transition:slide={{ duration: 400, easing: cubicOut, axis: 'y' }}
 >
-	<div class="relative mx-auto w-full max-w-screen-2xl">
-		{#if $ffmpegBanner.phase !== 'idle' || $activeTrackDownloads.length > 0}
-			<div
-				class="pointer-events-none absolute top-0 right-0 left-0 -translate-y-full transform pb-4"
-			>
-				<div class="mx-auto flex w-full max-w-2xl flex-col gap-2 px-4">
-					{#if $ffmpegBanner.phase !== 'idle'}
-						<div
-							class="ffmpeg-banner pointer-events-auto rounded-2xl border px-4 py-3 text-sm text-blue-100 shadow-xl"
-						>
-							<div class="flex items-start gap-3">
-								<div class="min-w-0 flex-1">
-									<p class="leading-5 font-semibold text-blue-50">
-										Downloading FFmpeg
-										{#if formatMegabytes($ffmpegBanner.totalBytes)}
-											<span class="text-blue-100/80">
-												({formatMegabytes($ffmpegBanner.totalBytes)})</span
-											>
-										{/if}
-									</p>
-									{#if $ffmpegBanner.phase === 'countdown'}
-										<p class="mt-1 text-xs text-blue-100/80">
-											Starting in {$ffmpegBanner.countdownSeconds} seconds…
-										</p>
-									{:else if $ffmpegBanner.phase === 'loading'}
-										<p class="mt-1 text-xs text-blue-100/80">
-											Preparing encoder… {formatPercent($ffmpegBanner.progress)}
-										</p>
-									{:else if $ffmpegBanner.phase === 'ready'}
-										<p class="mt-1 text-xs text-blue-100/80">FFmpeg is ready to use.</p>
-									{:else if $ffmpegBanner.phase === 'error'}
-										<p class="mt-1 text-xs text-red-200">
-											{$ffmpegBanner.error ?? 'Failed to load FFmpeg.'}
-										</p>
-									{/if}
-								</div>
-								{#if $ffmpegBanner.dismissible}
-									<button
-										onclick={() => downloadUiStore.dismissFfmpeg()}
-										class="rounded-full p-1 text-blue-100/70 transition-colors hover:bg-blue-500/20 hover:text-blue-50"
-										aria-label="Dismiss FFmpeg download"
-									>
-										<X size={16} />
-									</button>
-								{/if}
-							</div>
-							{#if $ffmpegBanner.phase === 'loading'}
-								<div class="mt-3 h-1.5 overflow-hidden rounded-full bg-blue-500/20">
-									<div
-										class="h-full rounded-full bg-blue-400 transition-all duration-200"
-										style="width: {Math.min(Math.max($ffmpegBanner.progress * 100, 6), 100)}%"
-									></div>
-								</div>
-							{/if}
-						</div>
-					{/if}
+  <div class="relative bg-transparent shadow-lg rounded-2xl {isCompact && !isHovering ? 'p-2' : 'p-6'}" style="transition: padding 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+    <div class="audio-player-glass overflow-hidden rounded-2xl border shadow-2xl">
+      <div class="relative {isCompact && !isHovering ? 'px-3 py-2' : 'px-4 py-3 pt-6 sm:pt-6'}" style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+        {#if $playerStore.currentTrack?.album?.title}
+            <div 
+                class="album-corner {isCompact && !isHovering ? 'compact' : ''}"
+                onclick={navigateToAlbum}
+                role="button"
+                tabindex="0"
+                onkeydown={(e) => e.key === 'Enter' && navigateToAlbum(e)}
+                style="cursor: pointer; pointer-events: auto;"
+            >
+                <div class="album-label">Estas escuchando:</div>
+				<div class="album-title">{formatAlbumTitle($playerStore.currentTrack.album.title)}</div>
+            </div>
+        {/if}
 
-					{#each $activeTrackDownloads as task (task.id)}
-						<div
-							class="download-popup pointer-events-auto rounded-2xl border px-4 py-3 text-sm text-gray-100 shadow-xl"
-						>
-							<div class="flex items-start gap-3">
-								<div class="flex min-w-0 flex-1 flex-col gap-1">
-									<p class="flex items-center gap-2 text-sm font-semibold text-gray-50">
-										{#if task.progress < 0.02}
-											<LoaderCircle size={16} class="animate-spin text-blue-300" />
-										{:else}
-											<Download size={16} class="text-blue-300" />
-										{/if}
-										<span class="truncate">{task.title}</span>
-									</p>
-									{#if task.subtitle}
-										<p class="truncate text-xs text-gray-400">{task.subtitle}</p>
-									{/if}
-									<div class="flex flex-wrap items-center gap-2 text-xs text-gray-400">
-										<span>{formatTransferStatus(task.receivedBytes, task.totalBytes)}</span>
-										<span aria-hidden="true">•</span>
-										<span>{formatPercent(task.progress)}</span>
-									</div>
-								</div>
-								<button
-									onclick={() =>
-										task.cancellable
-											? downloadUiStore.cancelTrackDownload(task.id)
-											: downloadUiStore.dismissTrackTask(task.id)}
-									class="rounded-full p-1 text-gray-400 transition-colors hover:bg-gray-800 hover:text-white"
-									aria-label={task.cancellable
-										? `Cancel download for ${task.title}`
-										: `Dismiss download for ${task.title}`}
-								>
-									<X size={16} />
-								</button>
-							</div>
-							<div class="mt-3 h-1.5 overflow-hidden rounded-full bg-gray-800">
-								<div
-									class="h-full rounded-full bg-blue-500 transition-all duration-200"
-									style="width: {Math.min(Math.max(task.progress * 100, 4), 100)}%"
-								></div>
-							</div>
-						</div>
-					{/each}
-				</div>
-			</div>
-		{/if}
-		<div class="audio-player-glass overflow-hidden rounded-2xl border shadow-2xl">
-			<div class="relative px-4 py-3">
-				{#if $playerStore.currentTrack}
-					<!-- Progress Bar -->
-					<div class="mb-3">
-						<button
-							onclick={handleSeek}
-							class="group relative h-1 w-full cursor-pointer overflow-hidden rounded-full bg-gray-700"
-							type="button"
-							aria-label="Seek position"
-						>
-							<div
-								class="pointer-events-none absolute inset-y-0 left-0 bg-blue-400/30 transition-all"
-								style="width: {bufferedPercent}%"
-								aria-hidden="true"
-							></div>
-							<div
-								class="pointer-events-none absolute inset-y-0 left-0 bg-blue-500 transition-all"
-								style="width: {getPercent($playerStore.currentTime, $playerStore.duration)}%"
-								aria-hidden="true"
-							></div>
-							<div
-								class="pointer-events-none absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-blue-500 opacity-0 transition-opacity group-hover:opacity-100"
-								style="left: {getPercent($playerStore.currentTime, $playerStore.duration)}%"
-								aria-hidden="true"
-							></div>
-						</button>
-						<div class="mt-1 flex justify-between text-xs text-gray-400">
-							<span>{formatTime($playerStore.currentTime)}</span>
-							<span>{formatTime($playerStore.duration)}</span>
-						</div>
-					</div>
+        <!-- Quality indicator in compact mode (top-right corner) -->
+        {#if isCompact && !isHovering && currentPlaybackQuality}
+            <div class="quality-corner compact">
+                <div class="quality-badge">
+                    {getQualityDetail(currentPlaybackQuality)}
+                </div>
+            </div>
+        {/if}
 
-					<div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-						<!-- Track Info -->
-						<div class="flex min-w-0 items-center gap-3 sm:flex-1">
-							{#if $playerStore.currentTrack.album.videoCover}
-								<video
-									src={losslessAPI.getVideoCoverUrl($playerStore.currentTrack.album.videoCover, '640')}
-									poster={$playerStore.currentTrack.album.cover
-										? losslessAPI.getCoverUrl($playerStore.currentTrack.album.cover, '640')
-										: undefined}
-									aria-label={$playerStore.currentTrack.title}
-									class="h-14 w-14 rounded object-cover shadow-lg"
-									autoplay
-									loop
-									muted
-									playsinline
-									preload="metadata"
-								></video>
-							{:else if $playerStore.currentTrack.album.cover}
-								<img
-									src={losslessAPI.getCoverUrl($playerStore.currentTrack.album.cover, '640')}
-									alt={$playerStore.currentTrack.title}
-									class="h-14 w-14 rounded object-cover shadow-lg"
-								/>
-							{/if}
-							<div class="min-w-0 flex-1">
-								<h3 class="truncate font-semibold text-white">
-									{$playerStore.currentTrack.title}
-								</h3>
-								<p class="truncate text-sm text-gray-400">
-									{$playerStore.currentTrack.artist.name}
-								</p>
-								<p class="text-xs text-gray-500">
-									<span>{formatQualityLabel(currentPlaybackQuality ?? undefined)}</span>
-									{#if currentPlaybackQuality &&
-										$playerStore.currentTrack.audioQuality &&
-										currentPlaybackQuality !== $playerStore.currentTrack.audioQuality}
-										<span class="mx-1 text-gray-600" aria-hidden="true">•</span>
-										<span class="text-gray-500">
-											({formatQualityLabel($playerStore.currentTrack.audioQuality)} available)
-										</span>
-									{/if}
-									{#if sampleRateLabel}
-										<span class="mx-1 text-gray-600" aria-hidden="true">•</span>
-										<span>{sampleRateLabel}</span>
-									{/if}
-								</p>
-							</div>
-						</div>
+        <!-- Wave Animation -->
+            <div class="{isCompact && !isHovering ? 'mb-2' : 'mb-3'} flex justify-center" style="transition: margin 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+                <ul class="wave-menu {!$playerStore.isPlaying ? 'paused' : ''} {isCompact && !isHovering ? 'compact' : ''}">
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                    <li></li>
+                </ul>
+            </div>
 
-						<div
-							class="flex flex-wrap items-center justify-between gap-3 sm:flex-nowrap sm:justify-end sm:gap-4"
-						>
-							<!-- Controls -->
-							<div
-								class="flex w-full flex-1 items-center justify-center gap-2 sm:w-auto sm:flex-none sm:justify-center"
-							>
-								<button
-									onclick={() => playerStore.previous()}
-									class="p-2 text-gray-400 transition-colors hover:text-white disabled:opacity-50"
-									disabled={$playerStore.queueIndex <= 0}
-									aria-label="Previous track"
-								>
-									<SkipBack size={20} />
-								</button>
+            <!-- Barra de progreso -->
+            <div class="{isCompact && !isHovering ? 'mb-2' : 'mb-3'}" style="transition: margin 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+                <button
+                    onclick={handleSeek}
+                    class="group relative {isCompact && !isHovering ? 'h-0.5' : 'h-1'} w-full cursor-pointer overflow-hidden rounded-full {isCompact && !isHovering ? 'bg-white/20' : 'bg-gray-700'}"
+                    type="button"
+                    aria-label="Seek position"
+                    style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                >
+                    <div
+                        class="pointer-events-none absolute inset-y-0 left-0 {isCompact && !isHovering ? 'bg-white/40' : 'bg-blue-400/30'} transition-all"
+                        style="width: {bufferedPercent}%; transition: background-color 0.5s cubic-bezier(0.4, 0, 0.2, 1), width 0.2s;"
+                        aria-hidden="true"
+                    ></div>
+                    <div
+                        class="pointer-events-none absolute inset-y-0 left-0 {isCompact && !isHovering ? 'bg-white' : 'bg-blue-500'} transition-all"
+                        style="width: {getPercent($playerStore.currentTime, $playerStore.duration)}%; transition: background-color 0.5s cubic-bezier(0.4, 0, 0.2, 1), width 0.2s;"
+                        aria-hidden="true"
+                    ></div>
+                </button>
+                <div class="mt-1 flex justify-between text-xs text-gray-400" style="transition: opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1); opacity: {isCompact && !isHovering ? '1' : '1'};">
+                    <span>{formatTime($playerStore.currentTime)}</span>
+                    <span>{formatTime($playerStore.duration)}</span>
+                </div>
+            </div>
 
-								<button
-									onclick={() => playerStore.togglePlay()}
-									class="rounded-full bg-white p-3 text-gray-900 transition-transform hover:scale-105"
-									aria-label={$playerStore.isPlaying ? 'Pause' : 'Play'}
-								>
-									{#if $playerStore.isPlaying}
-										<Pause size={24} fill="currentColor" />
-									{:else}
-										<Play size={24} fill="currentColor" />
-									{/if}
-								</button>
+            <!-- Info de la canción -->
+            <div class="flex {isCompact && !isHovering ? 'flex-row items-center gap-3' : 'flex-col sm:flex-row sm:items-center sm:justify-between gap-6'}" style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+                <!-- Carátula más grande -->
+                <div class="flex items-center {isCompact && !isHovering ? 'gap-2' : 'gap-4'} {isCompact && !isHovering ? 'flex-1' : 'sm:flex-1'}" style="transition: gap 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+                    {#if $playerStore.currentTrack.album.videoCover}
+                        <video
+                            src={losslessAPI.getVideoCoverUrl($playerStore.currentTrack.album.videoCover, '1080')}
+                            poster={$playerStore.currentTrack.album.cover
+                                ? losslessAPI.getCoverUrl($playerStore.currentTrack.album.cover, '1080')
+                                : undefined}
+                            aria-label={$playerStore.currentTrack.title}
+                            class="{isCompact && !isHovering ? 'h-16 w-16' : 'h-32 w-32 sm:h-40 sm:w-40'} rounded-xl object-cover shadow-2xl cursor-pointer hover:scale-105 transition-transform"
+                            style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                            onclick={navigateToAlbum}
+                            autoplay
+                            loop
+                            muted
+                            playsinline
+                            preload="metadata"
+                        ></video>
+                    {:else if $playerStore.currentTrack.album.cover}
+                        <img
+                            src={losslessAPI.getCoverUrl($playerStore.currentTrack.album.cover, '1080')}
+                            alt={$playerStore.currentTrack.title}
+                            class="{isCompact && !isHovering ? 'h-16 w-16' : 'h-32 w-32 sm:h-40 sm:w-40'} rounded-xl object-cover shadow-2xl cursor-pointer hover:scale-105 transition-transform"
+                            style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                            onclick={navigateToAlbum}
+                        />
+                    {/if}
 
-								<button
-									onclick={() => playerStore.next()}
-									class="p-2 text-gray-400 transition-colors hover:text-white disabled:opacity-50"
-									disabled={$playerStore.queueIndex >= $playerStore.queue.length - 1}
-									aria-label="Next track"
-								>
-									<SkipForward size={20} />
-								</button>
-							</div>
+                    <div class="min-w-0 flex-1">
+                        <h3 
+                            class="song-title {isCompact && !isHovering ? 'text-sm' : ''} cursor-pointer hover:underline" 
+                            style="transition: font-size 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                            onclick={navigateToAlbum}
+                        >
+                            <strong>{$playerStore.currentTrack.title}</strong>
+                        </h3>
+                        {#if !isCompact || isHovering}
+                        <p 
+                            class="song-artist cursor-pointer hover:underline"
+                            onclick={navigateToArtist}
+                        >
+                            {$playerStore.currentTrack.artist.name}
+                        </p>
+                        <p class="song-details text-xs mt-1">
+                            <strong>{formatQualityLabel(currentPlaybackQuality ?? undefined)}</strong>
+                            {#if getQualityDetail(currentPlaybackQuality ?? $playerStore.quality)}
+                                <span class="quality-detail"> — {getQualityDetail(currentPlaybackQuality ?? $playerStore.quality)}</span>
+                            {/if}
+                        </p>
 
-							<!-- Queue Toggle -->
-							<div class="flex items-center gap-2 sm:flex-none">
-								<button
-									onclick={() => lyricsStore.toggle()}
-									class="player-toggle-button {$lyricsStore.open
-										? 'player-toggle-button--active'
-										: ''}"
-									aria-label={$lyricsStore.open ? 'Hide lyrics popup' : 'Show lyrics popup'}
-									aria-expanded={$lyricsStore.open}
-									type="button"
-								>
-									<ScrollText size={18} />
-									<span class="hidden sm:inline">Lyrics</span>
-								</button>
-								<button
-									onclick={toggleQueuePanel}
-									class="player-toggle-button {showQueuePanel
-										? 'player-toggle-button--active'
-										: ''}"
-									aria-label="Toggle queue panel"
-									aria-expanded={showQueuePanel}
-									type="button"
-								>
-									<ListMusic size={18} />
-									<span class="hidden sm:inline">Queue ({$playerStore.queue.length})</span>
-								</button>
-							</div>
+                        {#if ($lyricsStore && ($lyricsStore.currentLyric || $lyricsStore.text))}
+                            <p class="lyrics mt-2">
+                                {$lyricsStore.currentLyric ?? $lyricsStore.text}
+                            </p>
+                        {/if}
 
-							<!-- Volume Control -->
-							<div class="flex items-center gap-2 sm:flex-none">
-								<button
-									onclick={toggleMute}
-									class="p-2 text-gray-400 transition-colors hover:text-white"
-									aria-label={isMuted ? 'Unmute' : 'Mute'}
-								>
-									{#if isMuted || $playerStore.volume === 0}
-										<VolumeX size={20} />
-									{:else}
-										<Volume2 size={20} />
-									{/if}
-								</button>
-								<input
-									type="range"
-									min="0"
-									max="1"
-									step="0.01"
-									value={$playerStore.volume}
-									oninput={handleVolumeChange}
-									class="hidden h-1 w-24 cursor-pointer appearance-none rounded-lg bg-gray-700 accent-white sm:block"
-									aria-label="Volume"
-								/>
-							</div>
-						</div>
-					</div>
+                        <!-- Indicador de doble clic para letras -->
+                        <div class="lyrics-hint mt-1 text-xs text-gray-400 opacity-60">
+                            <ScrollText size={12} class="inline mr-1" />
+                            Doble clic para letras
+                        </div>
+                        {:else}
+                        <p 
+                            class="song-artist text-xs truncate cursor-pointer hover:underline"
+                            onclick={navigateToArtist}
+                        >
+                            {$playerStore.currentTrack.artist.name}
+                        </p>
+                        {/if}
+                    </div>
+                </div>
 
-					{#if showQueuePanel}
-						<div
-							class="queue-panel mt-4 space-y-3 rounded-2xl border p-4 text-sm shadow-inner"
-							transition:slide={{ duration: 220, easing: cubicOut }}
-						>
-							<div class="flex items-center justify-between gap-2">
-								<div class="flex items-center gap-2 text-gray-300">
-									<ListMusic size={18} />
-									<span class="font-medium">Playback Queue</span>
-									<span class="rounded-full bg-gray-800 px-2 py-0.5 text-xs text-gray-400">
-										{$playerStore.queue.length}
-									</span>
-								</div>
-								<div class="flex items-center gap-2">
-									<button
-										onclick={handleShuffleQueue}
-										class="flex items-center gap-1 rounded-full border border-transparent px-3 py-1 text-xs tracking-wide text-gray-400 uppercase transition-colors hover:border-blue-500 hover:text-blue-200 disabled:opacity-40"
-										type="button"
-										disabled={$playerStore.queue.length <= 1}
-									>
-										<Shuffle size={14} />
-										Shuffle
-									</button>
-									<button
-										onclick={clearQueue}
-										class="flex items-center gap-1 rounded-full border border-transparent px-3 py-1 text-xs tracking-wide text-gray-400 uppercase transition-colors hover:border-red-500 hover:text-red-400"
-										type="button"
-										disabled={$playerStore.queue.length === 0}
-									>
-										<Trash2 size={14} />
-										Clear
-									</button>
-									<button
-										onclick={closeQueuePanel}
-										class="rounded-full p-1 text-gray-400 transition-colors hover:text-white"
-										aria-label="Close queue panel"
-									>
-										<X size={16} />
-									</button>
-								</div>
-							</div>
+                <!-- Controles -->
+                <div class="flex items-center justify-center {isCompact && !isHovering ? 'gap-2' : 'gap-4'}" style="transition: gap 0.5s cubic-bezier(0.4, 0, 0.2, 1);">
+                    <button
+                        onclick={() => playerStore.previous()}
+                        class="{isCompact && !isHovering ? 'p-1' : 'p-2'} text-gray-400 transition-all hover:text-black"
+                        style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                        disabled={$playerStore.queueIndex <= 0}
+                        aria-label="Previous track"
+                    >
+                        <SkipBack size={isCompact && !isHovering ? 18 : 22} />
+                    </button>
 
-							{#if $playerStore.queue.length > 0}
-								<ul class="max-h-60 space-y-2 overflow-y-auto pr-1">
-									{#each $playerStore.queue as queuedTrack, index}
-										<li>
-											<div
-												onclick={() => playFromQueue(index)}
-												onkeydown={(event) => {
-													if (event.key === 'Enter' || event.key === ' ') {
-														event.preventDefault();
-														playFromQueue(index);
-													}
-												}}
-												tabindex="0"
-												role="button"
-												class="group flex w-full cursor-pointer items-center gap-3 rounded-xl px-3 py-2 text-left transition-colors {index ===
-												$playerStore.queueIndex
-													? 'bg-blue-500/10 text-white'
-													: 'text-gray-200 hover:bg-gray-800/70'}"
-											>
-												<span
-													class="w-6 text-xs font-semibold text-gray-500 group-hover:text-gray-300"
-												>
-													{index + 1}
-												</span>
-												<div class="min-w-0 flex-1">
-													<p class="truncate text-sm font-medium">
-														{queuedTrack.title}
-													</p>
-													<p class="truncate text-xs text-gray-400 group-hover:text-gray-300">
-														{queuedTrack.artist.name}
-													</p>
-												</div>
-												<button
-													onclick={(event) => removeFromQueue(index, event)}
-													class="rounded-full p-1 text-gray-500 transition-colors hover:text-red-400"
-													aria-label={`Remove ${queuedTrack.title} from queue`}
-													type="button"
-												>
-													<X size={14} />
-												</button>
-											</div>
-										</li>
-									{/each}
-								</ul>
-							{:else}
-								<p
-									class="rounded-lg border border-dashed border-gray-700 bg-gray-900/70 px-3 py-8 text-center text-gray-400"
-								>
-									Queue is empty
-								</p>
-							{/if}
-						</div>
-					{/if}
+                    <button
+                        onclick={() => playerStore.togglePlay()}
+                        class="apple-btn {isCompact && !isHovering ? 'compact' : 'main'}" 
+                        aria-label={$playerStore.isPlaying ? 'Pause' : 'Play'}
+                        style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                    >
+                        {#if $playerStore.isPlaying}
+                            <Pause size={isCompact && !isHovering ? 18 : 26} fill="currentColor" />
+                        {:else}
+                            <Play size={isCompact && !isHovering ? 18 : 26} fill="currentColor" />
+                        {/if}
+                    </button>
 
-					{#if $playerStore.currentTrack && $playerStore.isLoading}
-						<div class="loading-overlay">
-							<div class="loading-equalizer" aria-hidden="true">
-								<span class="bar" style="animation-delay: 0ms"></span>
-								<span class="bar" style="animation-delay: 150ms"></span>
-								<span class="bar" style="animation-delay: 300ms"></span>
-								<span class="bar" style="animation-delay: 450ms"></span>
-							</div>
-							<p class="text-sm font-medium text-gray-200">Loading track…</p>
-						</div>
-					{/if}
-				{:else}
-					<div class="flex h-20 items-center justify-center text-sm text-gray-400">
-						Nothing is playing
-					</div>
-				{/if}
-			</div>
-		</div>
-	</div>
+                    <button
+                        onclick={() => playerStore.next()}
+                        class="{isCompact && !isHovering ? 'p-1' : 'p-2'} text-gray-400 transition-all hover:text-black"
+                        style="transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);"
+                        disabled={$playerStore.queueIndex >= $playerStore.queue.length - 1}
+                        aria-label="Next track"
+                    >
+                        <SkipForward size={isCompact && !isHovering ? 18 : 22} />
+                    </button>
+                </div>
+            </div>
+      </div>
+    </div>
+  </div>
 </div>
+{/if}
 
 <style>
-	.audio-player-glass {
-		background: transparent;
-		border-color: rgba(148, 163, 184, 0.2);
-		backdrop-filter: blur(var(--perf-blur-high, 32px)) saturate(var(--perf-saturate, 160%));
-		-webkit-backdrop-filter: blur(var(--perf-blur-high, 32px)) saturate(var(--perf-saturate, 160%));
-		box-shadow: 
-			0 30px 80px rgba(2, 6, 23, 0.6),
-			0 4px 18px rgba(15, 23, 42, 0.45),
-			inset 0 1px 0 rgba(255, 255, 255, 0.06);
-		transition: 
-			border-color 1.2s cubic-bezier(0.4, 0, 0.2, 1),
-			box-shadow 0.3s ease;
-	}
+    /* Nuevo diseño: más grande, neumorphism para botones y animaciones suaves */
 
-	.queue-panel {
-		background: transparent;
-		border-color: rgba(148, 163, 184, 0.2);
-		backdrop-filter: blur(var(--perf-blur-medium, 28px)) saturate(var(--perf-saturate, 160%));
-		-webkit-backdrop-filter: blur(var(--perf-blur-medium, 28px)) saturate(var(--perf-saturate, 160%));
-		box-shadow: 
-			0 8px 24px rgba(2, 6, 23, 0.4),
-			inset 0 1px 0 rgba(255, 255, 255, 0.05);
-		transition: 
-			border-color 1.2s cubic-bezier(0.4, 0, 0.2, 1),
-			box-shadow 0.3s ease;
-	}
+    :root {
+      --btn-bg: linear-gradient(180deg,#ffffff,#e6f0ff);
+      --btn-color: #1e40af;
+      --btn-shadow: 0 18px 48px rgba(37,99,235,0.12);
+      --btn-size: 72px;
+      --btn-small-size: 50px;
+    }
 
-	.ffmpeg-banner {
-		background: transparent;
-		border-color: var(--bloom-accent, rgba(59, 130, 246, 0.7));
-		backdrop-filter: blur(var(--perf-blur-high, 32px)) saturate(var(--perf-saturate, 160%));
-		-webkit-backdrop-filter: blur(var(--perf-blur-high, 32px)) saturate(var(--perf-saturate, 160%));
-		box-shadow: 
-			0 12px 32px rgba(2, 6, 23, 0.5),
-			0 2px 8px rgba(59, 130, 246, 0.2),
-			inset 0 1px 0 rgba(255, 255, 255, 0.08),
-			inset 0 0 30px rgba(59, 130, 246, 0.08);
-		transition: 
-			border-color 1.2s cubic-bezier(0.4, 0, 0.2, 1),
-			box-shadow 0.3s ease;
-	}
+    .audio-player-glass {
+        background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+        border: 1px solid rgba(255,255,255,0.06);
+        backdrop-filter: blur(18px) saturate(130%);
+        -webkit-backdrop-filter: blur(18px) saturate(130%);
+        box-shadow:
+            0 20px 50px rgba(3, 7, 18, 0.6),
+            inset 0 1px 0 rgba(255,255,255,0.03);
+        transition: box-shadow 220ms ease, transform 220ms ease;
+        border-radius: 20px;
+        /* evita el borde blanco por antialiasing: */
+        background-clip: padding-box;
+        border-color: transparent !important;
+    }
 
-	.download-popup {
-		background: transparent;
-		border-color: rgba(148, 163, 184, 0.2);
-		backdrop-filter: blur(var(--perf-blur-high, 32px)) saturate(var(--perf-saturate, 160%));
-		-webkit-backdrop-filter: blur(var(--perf-blur-high, 32px)) saturate(var(--perf-saturate, 160%));
-		box-shadow: 
-			0 12px 32px rgba(2, 6, 23, 0.5),
-			0 2px 8px rgba(15, 23, 42, 0.35),
-			inset 0 1px 0 rgba(255, 255, 255, 0.06);
-		transition: 
-			border-color 1.2s cubic-bezier(0.4, 0, 0.2, 1),
-			box-shadow 0.3s ease;
-	}
+    /* Quitar efecto de borde blanco al hacer hover (solo en este reproductor) */
+    .audio-player-glass:hover,
+    .audio-player-glass:focus,
+    .audio-player-glass:focus-visible {
+        /* eliminar cualquier borde/outline visible */
+        border-color: transparent !important;
+        outline: none !important;
+        /* eliminar el inset blanco y mantener solo la sombra oscura */
+        box-shadow: 0 20px 50px rgba(3, 7, 18, 0.6) !important;
+        -webkit-box-shadow: 0 20px 50px rgba(3, 7, 18, 0.6) !important;
+        transform: none;
+    }
 
-	.audio-player-backdrop {
-		isolation: isolate;
-	}
+    /* por si el contenedor externo añade sombra/borde al hacer hover */
+    .audio-player-backdrop .relative.mx-auto,
+    .audio-player-backdrop .relative.mx-auto:hover {
+        box-shadow: none !important;
+    }
 
-	.audio-player-backdrop::before {
-		content: '';
-		position: absolute;
-		inset: 0;
-		pointer-events: none;
-		z-index: 0;
-		backdrop-filter: blur(20px);
-		-webkit-backdrop-filter: blur(20px);
-		mask: linear-gradient(to bottom, transparent 0%, black 25%);
-	}
+    /* Contenedor principal */
+    .audio-player-backdrop {
+        padding-bottom: 1.25rem;
+    }
 
-	.audio-player-backdrop > * {
-		position: relative;
-		z-index: 1;
-	}
+    /* Progresos y tiempos */
+    .group.relative.h-1 {
+        height: 0.5rem;
+    }
 
-	input[type='range']::-webkit-slider-thumb {
-		appearance: none;
-		width: 12px;
-		height: 12px;
-		background: white;
-		border-radius: 50%;
-		cursor: pointer;
-	}
+    /* Cover grande y responsive */
+    .cover-container {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 1rem;
+    }
+    .cover-img {
+        height: 6.25rem; /* 100px */
+        width: 6.25rem;
+        border-radius: 14px;
+        object-fit: cover;
+        box-shadow: 0 12px 30px rgba(2,6,23,0.5);
+        cursor: pointer;
+        transition: transform 360ms cubic-bezier(.2,.9,.2,1), width 360ms, height 360ms, box-shadow 360ms;
+        flex-shrink: 0;
+    }
+    .cover-img.expanded {
+        height: 18.75rem; /* 300px */
+        width: 18.75rem;
+        border-radius: 18px;
+        transform: translateY(-6px) scale(1.02);
+        box-shadow: 0 28px 80px rgba(2,6,23,0.65);
+        position: relative;
+        z-index: 30;
+    }
 
-	input[type='range']::-moz-range-thumb {
-		width: 12px;
-		height: 12px;
-		background: white;
-		border-radius: 50%;
-		cursor: pointer;
-		border: none;
-	}
+    /* Título: cuando la carátula se expande, el título también aumenta */
+    .song-title {
+        display: block;
+        color: #ffffffff;
+        font-size: 1.05rem;
+        line-height: 1.2;
+        font-weight: 700;              /* negritas */
+        white-space: normal;           /* permite saltos de línea */
+        overflow: visible;
+        word-break: break-word;        /* corta palabras largas para evitar desbordes horizontales */
+        overflow-wrap: anywhere;       /* forzar wrap cuando sea necesario */
+        margin: 0 0 0.25rem 0;
+    }
+    .song-title.expanded {
+        font-size: 1.6rem;
+    }
 
-	.loading-overlay {
-		position: absolute;
-		inset: 0;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		gap: 0.75rem;
-		background: rgba(17, 24, 39, 0.65);
-		backdrop-filter: blur(6px);
-	}
+    .song-artist,
+    .song-details {
+        color: #000;
+        margin: 0.125rem 0 0 0;
+        white-space: normal;
+        overflow: visible;
+    }
 
-	.loading-equalizer {
-		display: flex;
-		align-items: flex-end;
-		gap: 0.4rem;
-		height: 1.75rem;
-	}
+    /* asegurar que la columna de texto pueda crecer en vertical sin forzar el ancho */
+    .min-w-0.flex-1 {
+        min-width: 0;
+        flex: 1 1 auto;
+    }
 
-	.loading-equalizer .bar {
-		width: 0.3rem;
-		height: 0.6rem;
-		border-radius: 9999px;
-		background: rgba(255, 255, 255, 0.85);
-		animation: equalize 1s ease-in-out infinite;
-	}
+    /* opcional: limitar a 2 líneas con ellipsis vertical si quieres */
+    .song-title--two-lines {
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: normal;
+    }
 
-	@keyframes equalize {
-		0% {
-			opacity: 0.4;
-			height: 0.5rem;
-		}
-		40% {
-			opacity: 1;
-			height: 1.7rem;
-		}
-		80% {
-			opacity: 0.6;
-			height: 0.8rem;
-		}
-		100% {
-			opacity: 0.4;
-			height: 0.5rem;
-		}
-	}
+    /* Controles estilo neumorphism */
+    .controls-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
 
-	/* Dynamic button styles */
-	button.rounded-full {
-		transition: 
-			border-color 1.2s cubic-bezier(0.4, 0, 0.2, 1),
-			color 0.2s ease,
-			background 0.2s ease;
-	}
+    .apple-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: var(--btn-small-size);
+        height: var(--btn-small-size);
+        border-radius: 9999px;
+        background: linear-gradient(180deg, #fbfdff, #e8eefc);
+        box-shadow:
+            0 8px 18px rgba(12, 20, 40, 0.18),
+            inset 0 1px 0 rgba(255,255,255,0.8);
+        border: 1px solid rgba(10,20,40,0.06);
+        cursor: pointer;
+        transition: transform 160ms cubic-bezier(.2,.9,.2,1), box-shadow 160ms, background 160ms, width 500ms cubic-bezier(0.4, 0, 0.2, 1), height 500ms cubic-bezier(0.4, 0, 0.2, 1);
+        color: #0b254e;
+    }
+    .apple-btn.main {
+        width: 4.5rem; /* 72px */
+        height: 4.5rem;
+        background: #ffffff; /* fondo blanco */
+        box-shadow:
+            0 10px 30px rgba(2,6,23,0.12),
+            inset 0 1px 0 rgba(255,255,255,0.6);
+        color: #000000; /* icono/relleno negro */
+        border: 1px solid rgba(0,0,0,0.06);
+    }
+    .apple-btn.compact {
+        width: 2.75rem; /* 44px */
+        height: 2.75rem;
+        background: #ffffff;
+        box-shadow:
+            0 6px 16px rgba(2,6,23,0.1),
+            inset 0 1px 0 rgba(255,255,255,0.5);
+        color: #000000;
+        border: 1px solid rgba(0,0,0,0.05);
+    }
+    .apple-btn svg { fill: currentColor; }
+    .apple-btn:hover { transform: translateY(-3px); }
+    .apple-btn:active { transform: scale(.96); }
 
-	button.rounded-full:hover {
-		border-color: var(--bloom-accent, rgba(59, 130, 246, 0.7)) !important;
-	}
+    /* Controles secundarios (volume, lyrics) */
+    .player-toggle-button {
+        border-radius: 9999px;
+        padding: 0.45rem 0.8rem;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.04);
+        color: rgba(220,220,230,0.9);
+        transition: background 160ms, transform 160ms;
+    }
+    .player-toggle-button:hover {
+        background: rgba(255,255,255,0.06);
+        transform: translateY(-3px);
+    }
 
-	/* Player toggle buttons (Lyrics, Queue) */
-	.player-toggle-button {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		border-radius: 9999px;
-		border: 1px solid rgba(148, 163, 184, 0.25);
-		background: transparent;
-		backdrop-filter: blur(16px) saturate(140%);
-		-webkit-backdrop-filter: blur(16px) saturate(140%);
-		padding: 0.5rem 0.75rem;
-		font-size: 0.875rem;
-		color: rgba(209, 213, 219, 0.85);
-		transition: 
-			border-color 200ms ease,
-			color 200ms ease,
-			box-shadow 200ms ease;
-	}
+    /* Volume and small controls */
+    input[type="range"] {
+        appearance: none;
+        height: 6px;
+        background: linear-gradient(90deg, #c7d2fe, #60a5fa);
+        border-radius: 9999px;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+        appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: white;
+        box-shadow: 0 4px 8px rgba(12,20,40,0.25);
+    }
 
-	.player-toggle-button:hover {
-		border-color: var(--bloom-accent, rgba(96, 165, 250, 0.6));
-		color: rgba(255, 255, 255, 0.95);
-	}
+    /* Queue panel */
+    .queue-panel {
+        margin-top: 1rem;
+        border-radius: 12px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+        border: 1px solid rgba(255,255,255,0.04);
+    }
 
-	.player-toggle-button--active {
-		border-color: var(--bloom-accent, rgba(96, 165, 250, 0.7));
-		color: rgba(255, 255, 255, 0.98);
-		box-shadow: inset 0 0 20px rgba(96, 165, 250, 0.15);
-	}
+    /* Loading overlay refinement */
+    .loading-overlay {
+        border-radius: 12px;
+    }
+
+    /* Responsive adjustments */
+    @media (max-width: 640px) {
+        .cover-img { height: 5.25rem; width: 5.25rem; }
+        .cover-img.expanded { height: 16rem; width: 16rem; }
+        .apple-btn { width: 44px; height: 44px; }
+        .apple-btn.main { width: 64px; height: 64px; }
+        .apple-btn.compact { width: 40px; height: 40px; }
+        .song-title.expanded { font-size: 1.25rem; }
+    }
+
+    /* Compact mode adjustments */
+    .audio-player-backdrop.compact {
+        cursor: pointer;
+    }
+    
+    .audio-player-backdrop.compact .song-title {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 0.875rem !important;
+    }
+
+    /* =========================
+   Cambios: detalles en blanco
+   ========================= */
+.song-title,
+.song-artist,
+.song-details,
+.song-album,
+.quality-detail,
+.lyrics {
+    color: #ffffff !important;
+}
+
+/* Asegurar contraste en elementos secundarios si fuera necesario */
+.song-artist,
+.song-details,
+.song-album,
+.quality-detail {
+    color: #ffffff !important;
+}
+
+/* =========================
+   Cambios: línea de tiempo en blanco
+   ========================= */
+/* fondo de la barra de progreso */
+.group.relative.h-1 {
+    background: rgba(255,255,255,0.06) !important;
+    border-radius: 9999px;
+}
+
+/* segmento buffered (primer div interno) */
+.group.relative.h-1 > div:nth-child(1) {
+    background: rgba(255,255,255,0.18) !important;
+}
+
+/* segmento reproducido (segundo div interno) */
+.group.relative.h-1 > div:nth-child(2) {
+    background: #ffffff !important;
+}
+
+/* asegurar contraste para los tiempos (0:00 / duración) */
+.audio-player-glass .text-gray-400 {
+    color: #ffffff !important;
+}
+
+/* =========================
+   Indicador de doble clic para letras
+   ========================= */
+.lyrics-hint {
+    transition: opacity 0.3s ease;
+    cursor: pointer;
+}
+
+.lyrics-hint:hover {
+    opacity: 1 !important;
+    color: #ffffff !important;
+}
+
+/* =========================
+   Wave Animation - Pequeña versión
+   ========================= */
+.wave-menu {
+  border: 2px solid transparent;
+  border-radius: 25px;
+  width: 120px;
+  height: 25px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  background: transparent;
+}
+
+.wave-menu.compact {
+  width: 80px;
+  height: 18px;
+}
+
+.wave-menu li {
+  list-style: none;
+  height: 18px;
+  width: 2px;
+  border-radius: 6px;
+  background: #ffffff;
+  margin: 0 3px;
+  padding: 0;
+  animation-name: wave1;
+  animation-duration: 0.6s;
+  animation-iteration-count: infinite;
+  animation-direction: alternate;
+  animation-timing-function: ease-in-out;
+  transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.wave-menu.compact li {
+  height: 12px;
+  width: 1.5px;
+  margin: 0 2px;
+}
+
+.wave-menu:hover > li {
+  background: #cccccc;
+}
+
+.wave-menu:hover {
+  background: transparent;
+}
+
+.wave-menu li:nth-child(2) {
+  animation-name: wave2;
+  animation-delay: 0.1s;
+  animation-duration: 0.8s;
+}
+
+.wave-menu li:nth-child(3) {
+  animation-name: wave3;
+  animation-delay: 0.2s;
+  animation-duration: 0.7s;
+}
+
+.wave-menu li:nth-child(4) {
+  animation-name: wave4;
+  animation-delay: 0.05s;
+  animation-duration: 0.9s;
+}
+
+.wave-menu li:nth-child(5) {
+  animation-delay: 0.3s;
+  animation-duration: 0.5s;
+}
+
+.wave-menu li:nth-child(6) {
+  animation-name: wave2;
+  animation-delay: 0.15s;
+  animation-duration: 0.75s;
+}
+
+.wave-menu li:nth-child(7) {
+  animation-name: wave1;
+  animation-delay: 0.25s;
+  animation-duration: 0.6s;
+}
+
+.wave-menu li:nth-child(8) {
+  animation-name: wave4;
+  animation-delay: 0.35s;
+  animation-duration: 0.85s;
+}
+
+.wave-menu li:nth-child(9) {
+  animation-name: wave3;
+  animation-delay: 0.4s;
+  animation-duration: 0.7s;
+}
+
+.wave-menu li:nth-child(10) {
+  animation-name: wave1;
+  animation-delay: 0.45s;
+  animation-duration: 0.55s;
+}
+
+/* Estado pausado - convertir en puntos pequeños */
+.wave-menu.paused li {
+  animation: none !important;
+  transform: scaleY(0.1) !important;
+  height: 2px !important;
+  border-radius: 50% !important;
+  transition: all 0.3s ease-in-out;
+}
+
+@keyframes wave1 {
+  0% {
+    transform: scaleY(0.3);
+  }
+  25% {
+    transform: scaleY(0.8);
+  }
+  50% {
+    transform: scaleY(0.4);
+  }
+  75% {
+    transform: scaleY(0.9);
+  }
+  100% {
+    transform: scaleY(0.2);
+  }
+}
+
+@keyframes wave2 {
+  0% {
+    transform: scaleY(0.2);
+  }
+  20% {
+    transform: scaleY(0.7);
+  }
+  40% {
+    transform: scaleY(0.3);
+  }
+  60% {
+    transform: scaleY(0.8);
+  }
+  80% {
+    transform: scaleY(0.4);
+  }
+  100% {
+    transform: scaleY(0.6);
+  }
+}
+
+@keyframes wave3 {
+  0% {
+    transform: scaleY(0.4);
+  }
+  30% {
+    transform: scaleY(0.9);
+  }
+  50% {
+    transform: scaleY(0.2);
+  }
+  70% {
+    transform: scaleY(0.7);
+  }
+  100% {
+    transform: scaleY(0.5);
+  }
+}
+
+@keyframes wave4 {
+  0% {
+    transform: scaleY(0.1);
+  }
+  15% {
+    transform: scaleY(0.6);
+  }
+  35% {
+    transform: scaleY(0.3);
+  }
+  55% {
+    transform: scaleY(0.8);
+  }
+  75% {
+    transform: scaleY(0.2);
+  }
+  100% {
+    transform: scaleY(0.7);
+  }
+}
+
+/* Album title in corner (small, same color) */
+    .album-corner {
+        position: absolute;
+        top: 18px; /* un poco más abajo */
+        left: 20px; /* un poco más a la derecha */
+        color: #ffffff;
+        opacity: 0.95;
+        pointer-events: none;
+        z-index: 50;
+        transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+        max-width: calc(100% - 56px);
+    }
+    .album-corner.compact {
+        top: 8px;
+        left: 12px;
+    }
+    .album-corner .album-label {
+        font-size: 0.63rem;
+        line-height: 1;
+        opacity: 0.85;
+        margin-bottom: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        transition: font-size 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .album-corner.compact .album-label {
+        font-size: 0.55rem;
+    }
+    .album-corner .album-title {
+        font-size: 0.75rem;
+        line-height: 1;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        transition: font-size 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .album-corner.compact .album-title {
+        font-size: 0.65rem;
+    }
+
+    /* Quality indicator in top-right corner (compact mode) */
+    .quality-corner {
+        position: absolute;
+        top: 18px;
+        right: 20px;
+        color: #ffffff;
+        opacity: 0.95;
+        pointer-events: none;
+        z-index: 50;
+        transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .quality-corner.compact {
+        top: 8px;
+        right: 12px;
+    }
+    .quality-corner .quality-badge {
+        font-size: 0.55rem;
+        line-height: 1;
+        font-weight: 600;
+        padding: 0;
+        background: transparent;
+        border: none;
+        white-space: nowrap;
+        transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
 </style>

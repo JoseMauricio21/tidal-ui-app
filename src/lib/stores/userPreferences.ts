@@ -18,7 +18,7 @@ const DEFAULT_STATE: UserPreferencesState = {
 	playbackQuality: 'HI_RES_LOSSLESS',
 	convertAacToMp3: false,
 	downloadCoversSeperately: false,
-	performanceMode: 'auto'
+	performanceMode: 'high'
 };
 
 function parseStoredPreferences(raw: string | null): UserPreferencesState {

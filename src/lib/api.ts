@@ -391,7 +391,7 @@ class LosslessAPI {
 		const url = `${this.baseUrl}/track/?id=${id}&quality=${quality}`;
 		let lastError: Error | null = null;
 
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
+		for (let attempt = 1; attempt <= 2; attempt += 1) {
 			const response = await this.fetch(url);
 			this.ensureNotRateLimited(response);
 			if (response.ok) {
@@ -430,11 +430,11 @@ class LosslessAPI {
 			const shouldRetry =
 				isTokenRetry || (detail ? /quality not found/i.test(detail) : response.status >= 500);
 
-			if (attempt === 3 || !shouldRetry) {
+			if (attempt === 2 || !shouldRetry) {
 				throw lastError;
 			}
 
-			await this.delay(200 * attempt);
+			await this.delay(30 * attempt);
 		}
 
 		throw lastError ?? new Error('Failed to get track');
@@ -447,10 +447,17 @@ class LosslessAPI {
 		const url = `${this.baseUrl}/dash/?id=${trackId}&quality=${quality}`;
 		let lastError: Error | null = null;
 
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
+		for (let attempt = 1; attempt <= 2; attempt += 1) {
 			const response = await this.fetch(url);
 			this.ensureNotRateLimited(response);
 			const contentType = response.headers.get('content-type');
+
+			// Immediate failure on 401 - don't retry authentication errors
+			if (response.status === 401) {
+				console.warn(`[DASH] 401 Unauthorized for track ${trackId} - Hi-Res quality may not be available. Falling back to LOSSLESS.`);
+				lastError = this.createDashUnavailableError(`Hi-Res quality not authorized (401)`);
+				break; // Don't retry on 401
+			}
 
 			if (response.ok) {
 				const payload = await response.text();
@@ -505,8 +512,8 @@ class LosslessAPI {
 				}
 			}
 
-			if (attempt < 3) {
-				await this.delay(200 * attempt);
+			if (attempt < 2) {
+				await this.delay(30 * attempt);
 			}
 		}
 
@@ -886,7 +893,7 @@ class LosslessAPI {
 
 		let lastError: Error | null = null;
 
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
+		for (let attempt = 1; attempt <= 2; attempt += 1) {
 			try {
 				const lookup = await this.getTrack(trackId, quality);
 				if (lookup.originalTrackUrl) {
@@ -903,8 +910,8 @@ class LosslessAPI {
 				lastError = error instanceof Error ? error : new Error(String(error));
 			}
 
-			if (attempt < 3) {
-				await this.delay(200 * attempt);
+			if (attempt < 2) {
+				await this.delay(30 * attempt);
 			}
 		}
 

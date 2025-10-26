@@ -3,7 +3,30 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		
+		<!-- DNS Prefetch and Preconnect for API endpoints -->
+		<link rel="dns-prefetch" href="https://kraken.squid.wtf">
+		<link rel="dns-prefetch" href="https://triton.squid.wtf">
+		<link rel="dns-prefetch" href="https://zeus.squid.wtf">
+		<link rel="dns-prefetch" href="https://aether.squid.wtf">
+		<link rel="dns-prefetch" href="https://phoenix.squid.wtf">
+		<link rel="dns-prefetch" href="https://shiva.squid.wtf">
+		<link rel="dns-prefetch" href="https://chaos.squid.wtf">
+		<link rel="dns-prefetch" href="https://california.monochrome.tf">
+		<link rel="dns-prefetch" href="https://london.monochrome.tf">
+		<link rel="preconnect" href="https://kraken.squid.wtf" crossorigin>
+		<link rel="preconnect" href="https://triton.squid.wtf" crossorigin>
+		<link rel="preconnect" href="https://phoenix.squid.wtf" crossorigin>
+		<link rel="preconnect" href="https://shiva.squid.wtf" crossorigin>
+		
+		<!-- Font Preloading for Performance -->
+		<link rel="preload" href="/fonts/figtree-v9-latin_latin-ext-regular.woff2" as="font" type="font/woff2" crossorigin="anonymous">
+		<link rel="preload" href="/fonts/figtree-v9-latin_latin-ext-700.woff2" as="font" type="font/woff2" crossorigin="anonymous">
+		
+		<!-- External Resources -->
+		<link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/@uimaxbai/am-lyrics@0.5.3/dist/src/am-lyrics.min.js" crossorigin="anonymous">
 		<script defer src="https://umami.binimum.org/script.js" data-website-id="a722aa59-e529-475b-b21d-0835ff659a93"></script>
+		
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

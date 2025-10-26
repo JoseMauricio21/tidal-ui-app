@@ -165,7 +165,7 @@
 	}
 </script>
 
-<div class="w-full">
+<div class="w-full mt-6">
 	{#if tracks.length === 0}
 		<div class="py-12 text-center text-gray-400">
 			<p>No tracks available</p>
@@ -183,7 +183,7 @@
 					<!-- Track Number / Play Button -->
 					<button
 						onclick={() => handlePlayTrack(track, index)}
-						class="flex w-8 flex-shrink-0 items-center justify-center transition-transform hover:scale-110"
+						class="flex w-8 flex-shrink-0 items-center justify-center transition-transform hover:scale-110 mt-1"
 						aria-label={isPlaying(track) ? 'Pause' : 'Play'}
 					>
 						{#if isPlaying(track)}
@@ -201,12 +201,12 @@
 						<img
 							src={losslessAPI.getCoverUrl(track.album.cover, '320')}
 							alt={track.title}
-							class="h-16 w-16 flex-shrink-0 rounded object-cover"
+							class="h-16 w-16 flex-shrink-0 rounded object-cover mt-1"
 						/>
 					{/if}
 
 					<!-- Track Info -->
-					<div class="min-w-0 flex-1">
+					<div class="min-w-0 flex-1 mt-1">
 						<h3
 							class="truncate font-medium {isCurrentTrack(track)
 								? 'text-blue-500'
@@ -248,25 +248,25 @@
 					</div>
 
 					<!-- Actions -->
-					<div class="flex flex-shrink-0 items-center gap-2">
-						<button
-							onclick={(event) => handlePlayNext(track, event)}
-							class="p-2 text-gray-400 transition-colors hover:text-white"
-							title="Play next"
-							aria-label={`Play ${track.title} next`}
-						>
-							<ListPlus size={18} />
-						</button>
-						<button
-							onclick={(event) => handleAddToQueue(track, event)}
-							class="p-2 text-gray-400 transition-colors hover:text-white"
-							title="Add to queue"
-							aria-label={`Add ${track.title} to queue`}
-						>
-							<Plus size={18} />
-						</button>
-						<button
-							onclick={(e) =>
+					<div class="flex flex-shrink-0 items-center gap-2 mt-1">
+                        <button
+                            onclick={(event) => handlePlayNext(track, event)}
+                            class="p-2 text-gray-400 transition-colors hover:text-white"
+                            title="Play next"
+                            aria-label={`Play ${track.title} next`}
+                        >
+                            <ListPlus size={18} />
+                        </button>
+                        <button
+                            onclick={(event) => handleAddToQueue(track, event)}
+                            class="p-2 text-gray-400 transition-colors hover:text-white"
+                            title="Add to queue"
+                            aria-label={`Add ${track.title} to queue`}
+                        >
+                            <Plus size={18} />
+                        </button>
+                        <button
+                            onclick={(e) =>
 								downloadingIds.has(track.id)
 									? handleCancelDownload(track.id, e)
 									: handleDownload(track, e)}
@@ -275,7 +275,7 @@
 							title={downloadingIds.has(track.id) ? 'Cancel download' : 'Download track'}
 							aria-busy={downloadingIds.has(track.id)}
 							aria-pressed={downloadingIds.has(track.id)}
-						>
+                        >
 							{#if downloadingIds.has(track.id)}
 								<span class="flex h-4 w-4 items-center justify-center">
 									{#if cancelledIds.has(track.id)}
@@ -291,14 +291,14 @@
 							{:else}
 								<Download size={18} />
 							{/if}
-						</button>
+                        </button>
 
-						<!-- Duration -->
-						<div class="flex w-16 items-center justify-end gap-1 text-sm text-gray-400">
+                        <!-- Duration -->
+                        <div class="flex w-16 items-center justify-end gap-1 text-sm text-gray-400">
 							<Clock size={14} />
 							{losslessAPI.formatDuration(track.duration)}
 						</div>
-					</div>
+                    </div>
 				</div>
 			{/each}
 		</div>

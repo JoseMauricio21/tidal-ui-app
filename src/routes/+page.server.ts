@@ -1,9 +1,7 @@
-import type { LayoutServerLoad } from './$types';
+import type { PageServerLoad } from './$types';
 import { env } from '$env/dynamic/private';
 
-export const load: LayoutServerLoad = () => {
+export const load: PageServerLoad = () => {
 	return {
-		title: env.TITLE ?? 'BiniLossless',
-		slogan: env.SLOGAN ?? 'The easiest way to stream CD-quality lossless FLACs.'
 	};
 };
